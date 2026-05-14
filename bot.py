@@ -8,6 +8,15 @@ Authentication: on first run the SDK will trigger a 2FA push to your Webull
 mobile app. Approve it, and a token is cached at conf/token.txt for future runs.
 """
 
+import sys
+
+if not ((3, 8) <= sys.version_info < (3, 13)):
+    raise RuntimeError(
+        f"Python 3.8–3.12 required (webull-openapi-python-sdk constraint). "
+        f"You are running {sys.version}. "
+        "Switch versions with: py -3.12 bot.py"
+    )
+
 import json
 import os
 import uuid
