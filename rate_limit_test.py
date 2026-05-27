@@ -12,9 +12,11 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Callable
 
 from dotenv import load_dotenv
@@ -71,64 +73,106 @@ def _build_clients() -> tuple[TradeClient, DataClient]:
     return trade, data
 
 
+def _record_status(result: RateLimitResult, status_code: int, seq: int, lock: Lock) -> None:
+    with lock:
+        result.http_statuses[status_code] += 1
+        if status_code == 429 and result.first_429 is None:
+            result.first_429 = seq
+            print(f"  429 rate-limit hit at request #{seq}")
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
+
 def _test_endpoint(
     trade: TradeClient,
     endpoint_name: str,
     api_call: Callable,
     num_requests: int = 200,
+    concurrent: bool = False,
+    max_workers: int = 30,
 ) -> RateLimitResult:
-    """Test an endpoint with rapid requests to find rate limit."""
-    
+    """Test an endpoint with rapid requests to find rate limit.
+
+    concurrent=True fires requests in parallel via a thread pool, which is
+    necessary for high-limit endpoints (e.g. order_preview at 150/10s) where
+    sequential latency would prevent saturating the window.
+    """
     doc_limit = RATE_LIMITS.get(endpoint_name, (0, 0))
     doc_limit_str = f"{doc_limit[0]}/{doc_limit[1]}s"
-    
+
     print(f"\n{'='*60}")
     print(f"Testing: {endpoint_name}")
     print(f"Documented Limit: {doc_limit_str}")
-    print(f"Planned Requests: {num_requests}")
+    print(f"Planned Requests: {num_requests}  (mode={'concurrent' if concurrent else 'sequential'})")
     print('='*60)
-    
+
     result = RateLimitResult(
         endpoint=endpoint_name,
         documented_limit=doc_limit_str,
         requests_made=0,
         time_window=0.0,
     )
-    
+    lock = Lock()
     start_time = time.time()
-    
-    for i in range(1, num_requests + 1):
-        try:
-            res = api_call()
-            status_code = res.status_code
-            result.http_statuses[status_code] += 1
-            
-            # Track first rate limit
-            if status_code == 429 and result.first_429 is None:
-                result.first_429 = i
-                print(f"  ⚠️  Rate limit (429) hit at request #{i}")
-            
-            # Stop early if we hit rate limit
-            if status_code == 429:
-                time.sleep(0.5)  # Back off
-            else:
-                # Small delay between requests to allow processing
-                time.sleep(0.01)
-            
-            if i % 10 == 0:
-                elapsed = time.time() - start_time
-                rate = i / elapsed
-                print(f"  {i} requests completed ({rate:.1f} req/s) - Status: {status_code}")
-            
-            result.requests_made = i
-            
-        except Exception as e:
-            print(f"  ❌ Error at request #{i}: {str(e)[:100]}")
-            break
-    
+
+    if concurrent:
+        def _run_one(seq: int):
+            try:
+                res = api_call()
+                _record_status(result, res.status_code, seq, lock)
+                return res.status_code
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    _record_status(result, 429, seq, lock)
+                    print(f"  429 exception at request #{seq}: {exc}")
+                    return 429
+                print(f"  Error at request #{seq}: {exc}")
+                return -1
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_run_one, i): i for i in range(1, num_requests + 1)}
+            completed = 0
+            for fut in as_completed(futures):
+                completed += 1
+                with lock:
+                    result.requests_made = completed
+                if completed % 20 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"  {completed} requests done ({completed / elapsed:.1f} req/s)")
+    else:
+        for i in range(1, num_requests + 1):
+            try:
+                res = api_call()
+                status_code = res.status_code
+                _record_status(result, status_code, i, lock)
+
+                if status_code == 429:
+                    time.sleep(0.5)
+                else:
+                    time.sleep(0.01)
+
+                if i % 10 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"  {i} requests completed ({i / elapsed:.1f} req/s) - Status: {status_code}")
+
+                result.requests_made = i
+
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    _record_status(result, 429, i, lock)
+                    print(f"  429 exception at request #{i}: {exc}")
+                    time.sleep(0.5)
+                    result.requests_made = i
+                    continue
+                print(f"  Error at request #{i}: {exc}")
+                break
+
     result.time_window = time.time() - start_time
     result.requests_per_sec = result.requests_made / result.time_window if result.time_window > 0 else 0.0
-    
+
     return result
 
 
@@ -186,12 +230,13 @@ def test_order_endpoints(trade: TradeClient) -> list[RateLimitResult]:
         return trade.order_v2.preview_order(ACCOUNT_ID, [order])
     
     results.append(_test_endpoint(
-        trade, "order_preview", order_preview, num_requests=200
+        trade, "order_preview", order_preview, num_requests=200, concurrent=True
     ))
     
     # Order History (2/2s)
     def order_history():
-        return trade.order_v2.get_order_history(ACCOUNT_ID, 1, 10)
+        # args: account_id, page_size (min 10), page (1-based)
+        return trade.order_v2.get_order_history(ACCOUNT_ID, 10, 1)
     
     results.append(_test_endpoint(
         trade, "order_history", order_history, num_requests=20
